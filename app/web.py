@@ -25,7 +25,6 @@ def _validate(payload: Any) -> Tuple[List[Dict[str, str]], Dict[str, Any] | None
     if not isinstance(payload, dict):
         errors.append({"path": "$", "message": "request body must be a JSON object"})
         return errors, None
-
     window = payload.get("window")
     if "window" not in payload:
         errors.append({"path": "window", "message": "window is required"})
@@ -137,10 +136,99 @@ def _validate(payload: Any) -> Tuple[List[Dict[str, str]], Dict[str, Any] | None
 
             clean_hits.append(hit)
 
+    # 互斥候选家族（可选；缺省时语义与既有完全一致）
+    clean_alts: List[Dict[str, Any]] = []
+    # 悬空引用检查所需的已声明命中标识
+    known_ids = {
+        h.get("id") for h in clean_hits if isinstance(h, dict)
+    }
+    if "alternatives" in payload:
+        alternatives = payload.get("alternatives")
+        if not isinstance(alternatives, list):
+            errors.append({
+                "path": "alternatives",
+                "message": "alternatives must be an array",
+            })
+        else:
+            seen_families = set()
+            for k, alt in enumerate(alternatives):
+                if not isinstance(alt, dict):
+                    errors.append({
+                        "path": f"alternatives[{k}]",
+                        "message": "alternative must be an object",
+                    })
+                    continue
+                family = alt.get("family")
+                if "family" not in alt:
+                    errors.append({
+                        "path": f"alternatives[{k}].family",
+                        "message": "family is required",
+                    })
+                elif not _is_ascii_str(family):
+                    errors.append({
+                        "path": f"alternatives[{k}].family",
+                        "message": "family must be a non-empty ASCII string",
+                    })
+                elif family in seen_families:
+                    errors.append({
+                        "path": f"alternatives[{k}].family",
+                        "message": "duplicate family",
+                    })
+                else:
+                    seen_families.add(family)
+
+                members = alt.get("members")
+                member_ids: List[Any] = []
+                if "members" not in alt:
+                    errors.append({
+                        "path": f"alternatives[{k}].members",
+                        "message": "members is required",
+                    })
+                elif not isinstance(members, list):
+                    errors.append({
+                        "path": f"alternatives[{k}].members",
+                        "message": "members must be an array",
+                    })
+                elif not (2 <= len(members) <= 6):
+                    errors.append({
+                        "path": f"alternatives[{k}].members",
+                        "message": "members must contain 2 to 6 items",
+                    })
+                else:
+                    seen_members = set()
+                    for p, member in enumerate(members):
+                        if not _is_ascii_str(member):
+                            errors.append({
+                                "path": f"alternatives[{k}].members[{p}]",
+                                "message": "member must be a non-empty ASCII string",
+                            })
+                            continue
+                        if member in seen_members:
+                            errors.append({
+                                "path": f"alternatives[{k}].members[{p}]",
+                                "message": "duplicate member in family",
+                            })
+                        else:
+                            seen_members.add(member)
+                            member_ids.append(member)
+                # 悬空引用：成员必须是已声明的命中标识
+                for member in member_ids:
+                    if member not in known_ids:
+                        errors.append({
+                            "path": f"alternatives[{k}].members",
+                            "message": f"member {member!r} does not match any hit id",
+                        })
+                clean_alts.append({"family": family, "members": member_ids})
+
     if errors:
         return errors, None
 
-    clean = {"window": window, "detectors": det_values, "hits": clean_hits}
+    clean = {
+        "window": window,
+        "detectors": det_values,
+        "hits": clean_hits,
+        "alternatives": clean_alts,
+    }
     return [], clean
 
 
@@ -157,7 +245,22 @@ def _run(clean: Dict[str, Any]) -> Dict[str, Any]:
     weights = [h["confidence"] for h in sorted_hits]
     ids = [h["id"] for h in sorted_hits]
 
-    result = solve(times, detectors, weights, window, id_order=ids)
+    # 互斥候选家族：标识 -> 排序后的下标（家族顺序沿用请求顺序）
+    id_to_pos = {h["id"]: k for k, h in enumerate(sorted_hits)}
+    families = [
+        tuple(id_to_pos[m] for m in alt["members"])
+        for alt in clean.get("alternatives", [])
+    ]
+    # 每个命中所属家族位（用于在归属关系中排除同家族命中对）
+    hit_fmask_web = [0] * len(sorted_hits)
+    for f, members in enumerate(families):
+        for pos in members:
+            hit_fmask_web[pos] |= 1 << f
+
+    result = solve(
+        times, detectors, weights, window,
+        id_order=ids, families=families,
+    )
 
     canonical_groups = [
         sorted(ids[j] for j in group) for group in result["canonical"]
@@ -167,12 +270,15 @@ def _run(clean: Dict[str, Any]) -> Dict[str, Any]:
     total = result["total_count"]
     pair_relations = []
     n = len(ids)
-    # 仅枚举“可同组”的命中对：探测器不同且时刻差不超过符合窗
+    # 仅枚举“在全部约束下可同组”的命中对：探测器不同、时刻差不超过符合窗，
+    # 且不同属任何互斥家族（同家族成员绝无合法事件可同时包含二者）。
     for a in range(n):
         for b in range(a + 1, n):
             if detectors[a] == detectors[b]:
                 continue
             if times[b] - times[a] > window:
+                continue
+            if hit_fmask_web[a] & hit_fmask_web[b]:
                 continue
             ways = result["pair_count"].get((a, b), 0)
             if ways == 0:
@@ -209,5 +315,5 @@ def audit() -> Any:
         return jsonify(_run(clean))
     except SolveError as exc:
         return jsonify({
-            "errors": [{"path": "hits", "message": str(exc)}]
+            "errors": [{"path": exc.path, "message": str(exc)}]
         }), 400

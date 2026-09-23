@@ -5,13 +5,22 @@
   2. 在满足 1 的前提下最少化事件数；
   3. 规范解按成员标识排序后的事件序列做词典序裁决。
 
+互斥候选家族
+------------
+可选 ``families`` 给出若干家族（每个家族为下标元组）：同一家族至多一个
+成员可被**分组**，作为噪声的成员不占用家族；一个命中可同时属于多个家族。
+求解器在 DP 中联合维护窗口占用与活跃家族的已用状态，只在合法解释中做
+最优裁决，不会先求无约束结果再事后删除冲突。
+
 复杂度保证
 ----------
 约定：任意长度为 ``W`` 的闭窗内至多 10 个命中。按 (时刻, 标识) 排序后，
 处理第 i 个命中时，所有“已被早先事件占用、尚未关窗”的命中都落在
-``[t_i, t_i+W]`` 内，至多 10 个。因此 DP 状态是至多 10 位的位掩码
-（每步至多 1024 个状态），整体为 O(n * 2^10 * 2^10) 上界内的扫描线
-动态规划，不枚举任何完整分组方案。方案计数为 Python 任意精度整数。
+``[t_i, t_i+W]`` 内，至多 10 个。窗口占用部分因此是至多 10 位的位掩码
+（每步至多 1024 态）。家族掩码只保留“已出现且尚有未处理成员”的家族；
+任一切分处这类家族（同时含已出现与未出现成员）至多 6 个，故家族部分
+至多 2^6=64 态。整体为 O(n · 1024 · 64 · 2^9) 上界内的扫描线动态规划，
+不枚举任何完整分组方案。方案计数为 Python 任意精度整数。
 """
 
 from __future__ import annotations
@@ -20,7 +29,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 
 class SolveError(ValueError):
-    """输入数据违反约束（如符合窗内命中数超限）。"""
+    """输入数据违反约束（如符合窗内命中数超限、互斥家族前沿超限）。"""
+
+    def __init__(self, message: str, path: str = "hits") -> None:
+        super().__init__(message)
+        self.path = path
 
 
 def _sweep_groups(
@@ -84,25 +97,20 @@ def _open_members(times: Sequence[int], window: int) -> List[List[int]]:
 _Cell = Tuple[int, int, int]
 
 
-def _better(a: _Cell, b: Optional[_Cell]) -> bool:
-    if b is None:
-        return True
-    if a[0] != b[0]:
-        return a[0] > b[0]
-    return a[1] < b[1]
-
-
 def solve(
     times: Sequence[int],
     detectors: Sequence[int],
     weights: Sequence[int],
     window: int,
     id_order: Optional[Sequence[str]] = None,
+    families: Optional[Sequence[Sequence[int]]] = None,
 ) -> dict:
     """计算最优分组、规范解、任意精度方案数与成对归属。
 
     调用前输入已按 (时刻, 标识) 稳定排序；id_order 给出排序后的标识，
-    用于规范解的词典序比较（若为 None 则按下标比较）。
+    用于规范解的词典序比较（若为 None 则按下标比较）。``families`` 为
+    互斥候选家族（成员下标元组的列表，每个家族 2–6 个互异下标），为
+    None 或空时语义与无家族完全一致。
     """
     n = len(times)
     if n == 0:
@@ -116,165 +124,276 @@ def solve(
                 "coincidence window contains more than 10 hits"
             )
 
-    group_masks: List[List[int]] = []
-    group_gains: List[List[int]] = []
+    # ---------- 家族元数据 ----------
+    # hit_fmask[j]：命中 j 所属家族的位（一个命中可属于多个家族）。
+    hit_fmask: List[int] = [0] * n
+    expire_fmask: List[int] = [0] * n
+    nfam = len(families) if families else 0
+    if families:
+        fam_min = [n] * nfam
+        fam_max = [-1] * nfam
+        for f, members in enumerate(families):
+            if not (2 <= len(members) <= 6):
+                raise SolveError(
+                    "family must contain 2 to 6 members", "alternatives"
+                )
+            if len(set(members)) != len(members):
+                raise SolveError(
+                    "family members must be distinct", "alternatives"
+                )
+            fbit = 1 << f
+            for j in members:
+                if not (0 <= j < n):
+                    raise SolveError(
+                        "family references an unknown hit", "alternatives"
+                    )
+                hit_fmask[j] |= fbit
+                if j < fam_min[f]:
+                    fam_min[f] = j
+                if j > fam_max[f]:
+                    fam_max[f] = j
+        # 前沿：切分 c（前 c 个命中已出现）处，同时含已出现/未出现成员的
+        # 家族数 = 满足 min < c <= max 的家族数，处处不得超过 6。
+        diff = [0] * (n + 2)
+        for f in range(nfam):
+            diff[fam_min[f] + 1] += 1
+            diff[fam_max[f] + 1] -= 1
+        active = 0
+        for c in range(1, n + 1):
+            active += diff[c]
+            if active > 6:
+                raise SolveError(
+                    "more than 6 families are open at a sweep cut",
+                    "alternatives",
+                )
+        for f in range(nfam):
+            expire_fmask[fam_max[f]] |= 1 << f
+
+    # ---------- 候选事件（含家族合法性） ----------
+    # 同一事件内不得出现同一家族的两个成员（二者互斥，不能同时为真）。
+    # gain_maps[i]：事件掩码 gm -> (可信度增益, 事件占用的家族位 gf)。
     open_masks: List[int] = []
+    gain_maps: List[Dict[int, Tuple[int, int]]] = []
+    group_by_mask: List[Dict[int, Tuple[int, ...]]] = []
     for i in range(n):
-        ms, gains = [], []
-        om = 0
+        gm_info: Dict[int, Tuple[int, int]] = {}
+        by_mask: Dict[int, Tuple[int, ...]] = {}
         for g in groups[i]:
-            m = 0
+            gf = 0
+            ok = True
             gain = 0
+            m = 0
             for j in g:
+                fb = hit_fmask[j]
+                if gf & fb:
+                    ok = False
+                    break
+                gf |= fb
                 m |= 1 << j
                 gain += weights[j]
-            ms.append(m)
-            gains.append(gain)
-        group_masks.append(ms)
-        group_gains.append(gains)
+            if ok:
+                gm_info[m] = (gain, gf)
+                by_mask[m] = g
+        gain_maps.append(gm_info)
+        group_by_mask.append(by_mask)
+        om = 0
         for j in opens[i]:
             om |= 1 << j
         open_masks.append(om)
-    # gm -> gain 映射，配合子掩码枚举使用
-    gain_maps = [
-        dict(zip(group_masks[i], group_gains[i])) for i in range(n)
+
+    # 状态为 (窗口占用掩码 wmask, 活跃家族已用掩码 fmask)，用两级字典
+    # F[i][wmask][fmask] = cell。可创建事件集合只取决于 (i, wmask)，故
+    # 每个 wmask 只做一次子掩码枚举，四个 DP 阶段共用。
+    # 事件转移描述：(目标窗口掩码 wm2, 可信度增益, 家族位 gf, 事件掩码 gm)。
+    event_cache: List[Dict[int, Tuple[Tuple[int, int, int, int], ...]]] = [
+        {} for _ in range(n)
     ]
 
-    def iter_event_masks(mask: int, i: int):
-        """枚举在待决议占用 mask 下、以 i 为锚点可创建的事件 (gm, gain)。
+    def event_options(i: int, mask: int) -> Tuple[Tuple[int, int, int, int], ...]:
+        """以 i 为锚点在窗口占用 mask 下可创建的事件。
 
-        仅枚举“未被占用的开放命中（锚点除外）”的子掩码，
-        三态计数 3^(k-1)（k≤10）。
+        返回 ``(wm2, gain, gf, gm)``：``wm2`` 为转移后窗口掩码（已清 i
+        位），``gf`` 为事件占用的家族位（调用方按 ``gf & fmask`` 过滤），
+        ``gm`` 为事件命中掩码。调用方需保证 i 未被占用。枚举 3^(k-1)
+        （k≤10），每个 (i, mask) 仅一次。
         """
-        bit_i = 1 << i
-        free = open_masks[i] & ~mask & ~bit_i
-        s = free
-        while True:
-            gm = s | bit_i
-            gain = gain_maps[i].get(gm)
-            if gain is not None:
-                yield gm, gain
-            if s == 0:
-                break
-            s = (s - 1) & free
+        cache = event_cache[i]
+        opts = cache.get(mask)
+        if opts is None:
+            bit_i = 1 << i
+            free = open_masks[i] & ~mask & ~bit_i
+            base = mask & ~bit_i
+            info = gain_maps[i]
+            out: List[Tuple[int, int, int, int]] = []
+            s = free
+            while True:
+                gm = s | bit_i
+                item = info.get(gm)
+                if item is not None:
+                    out.append((base | s, item[0], item[1], gm))
+                if s == 0:
+                    break
+                s = (s - 1) & free
+            opts = tuple(out)
+            cache[mask] = opts
+        return opts
 
     # ---------- 前向 DP ----------
-    # F[i][mask]：处理完前 i 个命中后，待决议占用掩码为 mask 时的
-    # (已锁定可信度和, 已锁定事件数, 方案数)。
-    forward: List[Dict[int, _Cell]] = [{0: (0, 0, 1)}]
+    # F[i][wmask][fmask]：处理完前 i 个命中后，窗口占用 wmask、家族已用
+    # fmask 时的 (已锁定可信度和, 已锁定事件数, 方案数)。噪声不占用家族；
+    # 事件转移同时占用窗口位与家族位；处理完 i 后过期最后成员已决的家族位。
+    forward: List[Dict[int, Dict[int, _Cell]]] = [{0: {0: (0, 0, 1)}}]
     for i in range(n):
         cur = forward[i]
-        nxt: Dict[int, _Cell] = {}
+        nxt: Dict[int, Dict[int, _Cell]] = {}
         bit_i = 1 << i
-        for mask, (sc, ev, cnt) in cur.items():
-            # 选择一：i 作为噪声（若 i 已被早先事件占用则强制此路）
-            nm = mask & ~bit_i
-            cell = (sc, ev, cnt)
-            old = nxt.get(nm)
+        exp = expire_fmask[i]
+
+        def merge(dst: Dict[int, _Cell], fm2: int,
+                  nsc: int, nev: int, cnt: int) -> None:
+            old = dst.get(fm2)
             if old is None:
-                nxt[nm] = cell
-            elif _better(cell, old):
-                nxt[nm] = cell
-            elif not _better(old, cell):
-                nxt[nm] = (old[0], old[1], old[2] + cnt)
-            if mask & bit_i:
+                dst[fm2] = (nsc, nev, cnt)
+            elif nsc > old[0] or (nsc == old[0] and nev < old[1]):
+                dst[fm2] = (nsc, nev, cnt)
+            elif nsc == old[0] and nev == old[1]:
+                dst[fm2] = (nsc, nev, old[2] + cnt)
+
+        for wmask, fdict in cur.items():
+            # 选择一：i 作为噪声（若 i 已被早先事件占用则强制此路）。
+            # 噪声不占用家族，仅过期已完结家族。
+            wn = wmask & ~bit_i
+            d_noise = nxt.get(wn)
+            if d_noise is None:
+                d_noise = {}
+                nxt[wn] = d_noise
+            for fm, (sc, ev, cnt) in fdict.items():
+                merge(d_noise, fm & ~exp, sc, ev, cnt)
+            if wmask & bit_i:
                 continue
-            # 选择二：以 i 为锚点创建事件（枚举空闲开放位的子掩码）
-            for gm, gain in iter_event_masks(mask, i):
-                nm2 = (mask | gm) & ~bit_i
-                cell2 = (sc + gain, ev + 1, cnt)
-                old2 = nxt.get(nm2)
-                if old2 is None:
-                    nxt[nm2] = cell2
-                elif _better(cell2, old2):
-                    nxt[nm2] = cell2
-                elif not _better(old2, cell2):
-                    nxt[nm2] = (old2[0], old2[1], old2[2] + cnt)
+            # 选择二：以 i 为锚点创建事件（联合占用窗口与家族）
+            for wm2, gain, gf, _gm in event_options(i, wmask):
+                d_ev = nxt.get(wm2)
+                if d_ev is None:
+                    # 新桶：所有在 i 处过期的家族都以 i 为成员，故其位
+                    # 必在 gf 中、在允许的 fm 中必为 0；fm -> fm2 单射，
+                    # 桶内无碰撞，可用 C 级推导整体构造。
+                    nxt[wm2] = {
+                        (fm | gf) & ~exp: (sc + gain, ev + 1, cnt)
+                        for fm, (sc, ev, cnt) in fdict.items()
+                        if not (gf & fm)
+                    }
+                else:
+                    for fm, (sc, ev, cnt) in fdict.items():
+                        if gf & fm:
+                            continue
+                        merge(d_ev, (fm | gf) & ~exp,
+                              sc + gain, ev + 1, cnt)
         forward.append(nxt)
 
-    final = forward[n][0]
-    best_score, best_events, total_count = final
+    best_score, best_events, total_count = forward[n][0][0]
 
     # ---------- 后向 DP ----------
-    # B[i][mask]：从步骤 i、待决议掩码 mask 出发，后缀可达的
-    # (可信度和, 事件数, 方案数) 最优值。只需前向可达的掩码（每步 ≤ 1024）。
-    backward: List[Dict[int, _Cell]] = [{} for _ in range(n + 1)]
-    backward[n] = {0: (0, 0, 1)}
+    # B[i][wmask][fmask]：从步骤 i 的状态出发，后缀可达的
+    # (可信度和, 事件数, 方案数) 最优值。只需前向可达的状态。
+    backward: List[Dict[int, Dict[int, _Cell]]] = [
+        {} for _ in range(n + 1)
+    ]
+    backward[n] = {0: {0: (0, 0, 1)}}
     for i in range(n - 1, -1, -1):
-        table: Dict[int, _Cell] = {}
+        table: Dict[int, Dict[int, _Cell]] = {}
         bit_i = 1 << i
         b_next = backward[i + 1]
-        for mask in forward[i]:
-            # 选择一：噪声（被占用时为强制转移）
-            best: Optional[_Cell] = None
-            nm0 = mask & ~bit_i
-            suffix = b_next.get(nm0)
-            if suffix is not None:
-                best = suffix
-            if not (mask & bit_i):
-                # 选择二：以 i 为锚点创建事件（枚举空闲开放位的子掩码）
-                for gm, gain in iter_event_masks(mask, i):
-                    nm = (mask | gm) & ~bit_i
-                    suffix = b_next.get(nm)
-                    if suffix is None:
-                        continue
-                    cell = (suffix[0] + gain, suffix[1] + 1, suffix[2])
-                    if best is None or _better(cell, best):
-                        best = cell
-                    elif not _better(best, cell):
-                        best = (best[0], best[1], best[2] + cell[2])
-            if best is not None:
-                table[mask] = best
+        exp = expire_fmask[i]
+        for wmask, fdict in forward[i].items():
+            wn = wmask & ~bit_i
+            occupied = bool(wmask & bit_i)
+            d_noise = b_next.get(wn)
+            opts = () if occupied else event_options(i, wmask)
+            out: Dict[int, _Cell] = {}
+            for fm in fdict:
+                best: Optional[_Cell] = None
+                # 选择一：噪声（被占用时为强制转移）
+                if d_noise is not None:
+                    best = d_noise.get(fm & ~exp)
+                if not occupied:
+                    # 选择二：以 i 为锚点创建事件
+                    for wm2, gain, gf, _gm in opts:
+                        if gf & fm:
+                            continue
+                        d2 = b_next.get(wm2)
+                        if d2 is None:
+                            continue
+                        suffix = d2.get((fm | gf) & ~exp)
+                        if suffix is None:
+                            continue
+                        cell = (suffix[0] + gain, suffix[1] + 1, suffix[2])
+                        if best is None:
+                            best = cell
+                        elif cell[0] > best[0] or (
+                            cell[0] == best[0] and cell[1] < best[1]
+                        ):
+                            best = cell
+                        elif cell[0] == best[0] and cell[1] == best[1]:
+                            best = (best[0], best[1], best[2] + cell[2])
+                if best is not None:
+                    out[fm] = best
+            if out:
+                table[wmask] = out
         backward[i] = table
 
     # ---------- 规范解（词典序裁决） ----------
-    # 对每个可达状态 (i, mask) 求后缀的“成员标识排序后的事件序列”
-    # 的词典序最小值（仅限达到该状态最优 (可信度, 事件数) 的转移）。
+    # 对每个可达状态 (i, mask, fm) 求后缀的“成员标识排序后的事件序列”
+    # 的词典序最小值（仅限达到该状态最优 (可信度, 事件数) 的合法转移）。
     # 事件在锚点处加入，与后缀已排序序列做单点插入后比较。
-    # 预生成每个候选事件的比较键（按掩码索引）。
-    # 有标识序列时按标识（字符串元组）裁决，否则直接按下标（整数元组）。
     def _key(j: int):
         return id_order[j] if id_order is not None else j
 
-    group_by_mask: List[Dict[int, Tuple[int, ...]]] = [
-        {m: g for g, m in zip(groups[i], group_masks[i])}
-        for i in range(n)
-    ]
     gm_to_keys: List[Dict[int, Tuple[object, ...]]] = [
         {
             m: tuple(_key(j) for j in g)
-            for g, m in zip(groups[i], group_masks[i])
+            for m, g in group_by_mask[i].items()
         }
         for i in range(n)
     ]
 
-    memo: Dict[Tuple[int, int], Tuple[Tuple[object, ...], ...]] = {}
+    # memo[i][(wmask, fmask)] -> 规范后缀序列
+    memo: List[Dict[Tuple[int, int], Tuple[Tuple[object, ...], ...]]] = [
+        {} for _ in range(n + 1)
+    ]
 
     def canonical_suffix(
-        i: int, mask: int
+        i: int, wmask: int, fm: int
     ) -> Tuple[Tuple[object, ...], ...]:
         if i == n:
             return ()
-        key = (i, mask)
-        if key in memo:
-            return memo[key]
-        target = backward[i][mask]
+        memo_i = memo[i]
+        state = (wmask, fm)
+        cached = memo_i.get(state)
+        if cached is not None:
+            return cached
+        target = backward[i][wmask][fm]
         bit_i = 1 << i
+        exp = expire_fmask[i]
         best_seq: Optional[Tuple[Tuple[object, ...], ...]] = None
 
         def consider(
             gain: int,
             events_added: int,
-            nm: int,
+            wm2: int,
+            fm2: int,
             inserted: Optional[Tuple[object, ...]],
         ) -> None:
             nonlocal best_seq
-            suf = backward[i + 1].get(nm)
+            d2 = backward[i + 1].get(wm2)
+            if d2 is None:
+                return
+            suf = d2.get(fm2)
             if suf is None:
                 return
             if gain + suf[0] != target[0] or events_added + suf[1] != target[1]:
                 return
-            suffix_seq = canonical_suffix(i + 1, nm)
+            suffix_seq = canonical_suffix(i + 1, wm2, fm2)
             if inserted is None:
                 cand = suffix_seq
             else:
@@ -292,17 +411,18 @@ def solve(
                 best_seq = cand
 
         # 噪声（被占用时为强制转移）
-        consider(0, 0, mask & ~bit_i, None)
-        if not (mask & bit_i):
-            for gm, gain in iter_event_masks(mask, i):
-                nm = (mask | gm) & ~bit_i
-                consider(gain, 1, nm, gm_to_keys[i][gm])
+        consider(0, 0, wmask & ~bit_i, fm & ~exp, None)
+        if not (wmask & bit_i):
+            for wm2, gain, gf, gm in event_options(i, wmask):
+                if gf & fm:
+                    continue
+                consider(gain, 1, wm2, (fm | gf) & ~exp, gm_to_keys[i][gm])
 
         assert best_seq is not None
-        memo[key] = best_seq
+        memo_i[state] = best_seq
         return best_seq
 
-    canonical_seq = canonical_suffix(0, 0)
+    canonical_seq = canonical_suffix(0, 0, 0)
     # 将比较键还原为下标元组
     if id_order is not None:
         key_to_index = {id_order[j]: j for j in range(n)}
@@ -316,29 +436,35 @@ def solve(
     member_count: Dict[int, int] = {}
     pair_count: Dict[Tuple[int, int], int] = {}
     for i in range(n):
-        f_table = forward[i]
         b_next = backward[i + 1]
-        for fmask, (fsc, fev, fcnt) in f_table.items():
-            if fmask & (1 << i):
+        exp = expire_fmask[i]
+        bit_i = 1 << i
+        for wmask, fdict in forward[i].items():
+            if wmask & bit_i:
                 continue
-            for gm, gain in iter_event_masks(fmask, i):
-                nm = (fmask | gm) & ~(1 << i)
-                suf = b_next.get(nm)
-                if suf is None:
-                    continue
-                if fsc + gain + suf[0] != best_score:
-                    continue
-                if fev + 1 + suf[1] != best_events:
-                    continue
-                g = group_by_mask[i][gm]
-                ways = fcnt * suf[2]
-                for j in g:
-                    member_count[j] = member_count.get(j, 0) + ways
-                for a_idx in range(len(g)):
-                    for b_idx in range(a_idx + 1, len(g)):
-                        a, b = g[a_idx], g[b_idx]
-                        key = (a, b)
-                        pair_count[key] = pair_count.get(key, 0) + ways
+            for fm, (fsc, fev, fcnt) in fdict.items():
+                for wm2, gain, gf, gm in event_options(i, wmask):
+                    if gf & fm:
+                        continue
+                    d2 = b_next.get(wm2)
+                    if d2 is None:
+                        continue
+                    suf = d2.get((fm | gf) & ~exp)
+                    if suf is None:
+                        continue
+                    if fsc + gain + suf[0] != best_score:
+                        continue
+                    if fev + 1 + suf[1] != best_events:
+                        continue
+                    g = group_by_mask[i][gm]
+                    ways = fcnt * suf[2]
+                    for j in g:
+                        member_count[j] = member_count.get(j, 0) + ways
+                    for a_idx in range(len(g)):
+                        for b_idx in range(a_idx + 1, len(g)):
+                            a, b = g[a_idx], g[b_idx]
+                            pair_key = (a, b)
+                            pair_count[pair_key] = pair_count.get(pair_key, 0) + ways
 
     return {
         "best_score": best_score,

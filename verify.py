@@ -96,6 +96,32 @@ def algorithm_checks() -> None:
     check("attribution: always pair count equals total",
           r2["pair_count"].get((0, 1)) == r2["total_count"] == 1)
 
+    # 5) 互斥家族：远隔候选 (0,1)@0 与 (2,3)@100 由家族 (0,2) 互斥，
+    #    最优由 400/2 事件降为 200/1 事件，两个等优解由规范序列裁决。
+    rf = solve([0, 0, 100, 100], [0, 1, 0, 1], [100] * 4, 2,
+               id_order=["a", "b", "c", "d"], families=[(0, 2)])
+    check("families: far-apart exclusives change optimum",
+          rf["best_score"] == 200 and rf["best_events"] == 1
+          and rf["total_count"] == 2 and rf["canonical"] == [(0, 1)],
+          str((rf["best_score"], rf["best_events"], rf["total_count"],
+               rf["canonical"])))
+    # 噪声成员不占用家族：0 无伙伴只能噪声，同族 1 仍可与 2 同组
+    rn = solve([0, 10, 10], [0, 0, 1], [9, 9, 9], 2,
+               id_order=["a", "b", "c"], families=[(0, 1)])
+    check("families: noise member does not consume family",
+          rn["best_score"] == 18 and rn["canonical"] == [(1, 2)])
+    # 前沿边界：6 个家族在首切分处同时敞开合法，7 个拒绝
+    from app.solver import SolveError
+    ok6 = solve(list(range(7)), [k % 8 for k in range(7)], [1] * 7, 0,
+                families=[(0, k) for k in range(1, 7)])
+    check("families: frontier of 6 accepted", ok6["total_count"] >= 1)
+    try:
+        solve(list(range(8)), [k % 8 for k in range(8)], [1] * 8, 0,
+              families=[(0, k) for k in range(1, 8)])
+        check("families: frontier of 7 rejected", False)
+    except SolveError:
+        check("families: frontier of 7 rejected", True)
+
 
 # ---------------------------------------------------------------- 测试套件
 def run_tests() -> None:
@@ -177,6 +203,61 @@ def http_smoke() -> None:
         check("http: field errors by path without results",
               exc.code == 400
               and {"window", "detectors", "hits"} <= paths
+              and "optimal_confidence" not in body)
+
+    # 互斥家族：远隔候选互斥改变最优；缺省 / 空数组兼容回归
+    fam_payload = {
+        "window": 2,
+        "detectors": ["A", "B"],
+        "hits": [
+            {"id": "h1", "detector": "A", "time": 0, "confidence": 10},
+            {"id": "h2", "detector": "B", "time": 0, "confidence": 10},
+            {"id": "h3", "detector": "A", "time": 9, "confidence": 10},
+            {"id": "h4", "detector": "B", "time": 9, "confidence": 10},
+        ],
+        "alternatives": [{"family": "F1", "members": ["h1", "h3"]}],
+    }
+    status, body = _request("POST", "/audit", fam_payload)
+    check("http: alternatives change optimum over API",
+          status == 200
+          and body["optimal_confidence"] == 20
+          and body["event_count"] == 1
+          and body["solution_count"] == "2"
+          and body["canonical_groups"] == [["h1", "h2"]],
+          json.dumps(body))
+    status, body_empty = _request(
+        "POST", "/audit",
+        {k: v for k, v in fam_payload.items() if k != "alternatives"},
+    )
+    status2, body_explicit = _request(
+        "POST", "/audit", {**fam_payload, "alternatives": []}
+    )
+    check("http: omitted vs empty alternatives identical",
+          body_empty == body_explicit
+          and body_empty["optimal_confidence"] == 40)
+    # 悬空引用 / 重复家族 / 前沿超限均按路径拒绝且不夹带结果
+    bad_fam = {
+        "window": 0, "detectors": ["A", "B"],
+        "hits": [
+            {"id": f"h{k}", "detector": "AB"[k % 2], "time": 0,
+             "confidence": 1}
+            for k in range(4)
+        ],
+        "alternatives": [
+            {"family": "F", "members": ["h0", "ghost"]},
+            {"family": "F", "members": ["h0", "h1"]},
+        ],
+    }
+    try:
+        _request("POST", "/audit", bad_fam)
+        check("http: invalid alternatives rejected", False)
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read().decode())
+        paths = {e["path"] for e in body.get("errors", [])}
+        check("http: alternatives errors by path",
+              exc.code == 400
+              and "alternatives[0].members" in paths
+              and "alternatives[1].family" in paths
               and "optimal_confidence" not in body)
 
 

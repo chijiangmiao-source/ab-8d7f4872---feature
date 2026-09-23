@@ -128,3 +128,166 @@ def test_audit_solution_count_is_string(client):
     # 任意精度以字符串传输
     assert isinstance(data["solution_count"], str)
     int(data["solution_count"])
+
+
+# ------------------------------------------------------------- alternatives
+def _alt_payload(**over):
+    payload = {
+        "window": 3,
+        "detectors": ["A", "B"],
+        "hits": [
+            {"id": "h1", "detector": "A", "time": 0, "confidence": 10},
+            {"id": "h2", "detector": "B", "time": 1, "confidence": 10},
+            {"id": "h3", "detector": "A", "time": 10, "confidence": 10},
+            {"id": "h4", "detector": "B", "time": 11, "confidence": 10},
+        ],
+    }
+    payload.update(over)
+    return payload
+
+
+def test_alternatives_far_apart_candidates_change_optimum(client):
+    # 无家族：远隔两对各自成事件，共 40 可信度 / 2 事件
+    resp = client.post("/audit", json=_alt_payload())
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["optimal_confidence"] == 40
+    assert data["event_count"] == 2
+
+    # 家族 F1={h1,h3}：两候选互斥，最优降为 20 / 1 事件，两个等优解
+    payload = _alt_payload(alternatives=[
+        {"family": "F1", "members": ["h1", "h3"]},
+    ])
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    data = resp.get_json()
+    assert data["optimal_confidence"] == 20
+    assert data["event_count"] == 1
+    assert data["solution_count"] == "2"
+    # 规范裁决取标识序列更小者 [h1,h2]
+    assert data["canonical_groups"] == [["h1", "h2"]]
+    rel = {(r["a"], r["b"]): r["relation"] for r in data["pair_relations"]}
+    assert rel[("h1", "h2")] == "optional"
+    assert rel[("h3", "h4")] == "optional"
+
+
+def test_alternatives_overlapping_families_tiebreak(client):
+    # 三个远隔时段的等优候选事件，由三个两两交叠的家族锁成两两互斥，
+    # 每个事件同时占用两个交叠家族；最优取其一，规范序列裁决。
+    payload = {
+        "window": 2,
+        "detectors": ["A", "B"],
+        "hits": [
+            {"id": "a", "detector": "A", "time": 0, "confidence": 5},
+            {"id": "q", "detector": "B", "time": 0, "confidence": 5},
+            {"id": "b", "detector": "A", "time": 10, "confidence": 5},
+            {"id": "r", "detector": "B", "time": 10, "confidence": 5},
+            {"id": "h", "detector": "A", "time": 20, "confidence": 5},
+            {"id": "p", "detector": "B", "time": 20, "confidence": 5},
+        ],
+        "alternatives": [
+            {"family": "F1", "members": ["a", "h"]},
+            {"family": "F2", "members": ["b", "h"]},
+            {"family": "F3", "members": ["a", "b"]},
+        ],
+    }
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 200, resp.get_json()
+    data = resp.get_json()
+    assert data["optimal_confidence"] == 10
+    assert data["event_count"] == 1
+    assert data["solution_count"] == "3"
+    assert data["canonical_groups"] == [["a", "q"]]
+    rel = {(r["a"], r["b"]): r["relation"] for r in data["pair_relations"]}
+    assert rel[("a", "q")] == "optional"
+    assert rel[("b", "r")] == "optional"
+    assert rel[("h", "p")] == "optional"
+    # 同家族命中对不可能同组，不列入归属
+    assert ("a", "h") not in rel
+    assert ("a", "b") not in rel
+    assert ("b", "h") not in rel
+
+
+def test_alternatives_noise_member_does_not_consume_family(client):
+    payload = {
+        "window": 0,
+        "detectors": ["A", "B"],
+        "hits": [
+            {"id": "x", "detector": "A", "time": 0, "confidence": 9},
+            {"id": "y", "detector": "A", "time": 5, "confidence": 9},
+            {"id": "p", "detector": "B", "time": 5, "confidence": 9},
+            {"id": "q", "detector": "B", "time": 9, "confidence": 1},
+        ],
+        "alternatives": [{"family": "F", "members": ["x", "y"]}],
+    }
+    resp = client.post("/audit", json=payload)
+    data = resp.get_json()
+    assert resp.status_code == 200
+    # x 在 t=0 无伙伴 -> 噪声（不占家族）；y,p 同刻成事件
+    assert data["optimal_confidence"] == 18
+    assert data["canonical_groups"] == [["p", "y"]]
+
+
+def test_alternatives_validation_errors_by_path(client):
+    payload = _alt_payload()
+    payload["alternatives"] = [
+        "not-an-object",
+        {"family": "F1", "members": ["h1"]},            # 少于 2 个
+        {"family": "F1", "members": ["h1", "h1", "h3"]},  # 重复家族 + 重复成员
+        {"family": "", "members": ["h1", "ghost"]},      # 空标识 + 悬空引用
+        {"family": "F3", "members": [1, 2]},             # 成员非字符串
+        {"family": "F4"},                                # 缺 members
+    ]
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert "optimal_confidence" not in data
+    paths = {e["path"] for e in data["errors"]}
+    assert "alternatives[0]" in paths
+    assert "alternatives[1].members" in paths
+    assert "alternatives[2].family" in paths
+    assert "alternatives[2].members[1]" in paths
+    assert "alternatives[3].family" in paths
+    assert "alternatives[3].members" in paths           # 悬空引用 ghost
+    assert "alternatives[4].members[0]" in paths
+    assert "alternatives[5].members" in paths
+
+
+def test_alternatives_must_be_array(client):
+    payload = _alt_payload(alternatives={"family": "F", "members": ["h1", "h2"]})
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 400
+    paths = {e["path"] for e in resp.get_json()["errors"]}
+    assert "alternatives" in paths
+
+
+def test_alternatives_frontier_overflow_rejected(client):
+    # 8 个命中同刻；7 个家族 {h0, hk} 在切分处同时敞开 -> 拒绝
+    hits = [
+        {"id": f"h{k}", "detector": "AB"[k % 2], "time": 0,
+         "confidence": 1}
+        for k in range(8)
+    ]
+    alternatives = [
+        {"family": f"F{k}", "members": ["h0", f"h{k}"]}
+        for k in range(1, 8)
+    ]
+    payload = {"window": 0, "detectors": ["A", "B"],
+               "hits": hits, "alternatives": alternatives}
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert "optimal_confidence" not in data
+    assert all(e["path"] == "alternatives" for e in data["errors"])
+
+
+def test_no_alternatives_compat_regression(client):
+    # 显式空数组与缺省两种形式，响应结构、数值与既有语义一致
+    base = _payload()
+    r1 = client.post("/audit", json=base).get_json()
+    r2 = client.post("/audit", json=_payload(alternatives=[])).get_json()
+    assert r1 == r2
+    assert set(r1) == {
+        "optimal_confidence", "event_count", "solution_count",
+        "canonical_groups", "pair_relations",
+    }

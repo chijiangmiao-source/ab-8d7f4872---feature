@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.solver import _sweep_groups
 
@@ -12,15 +12,41 @@ def brute_solve(
     detectors: Sequence[int],
     weights: Sequence[int],
     window: int,
+    families: Optional[Sequence[Sequence[int]]] = None,
 ) -> dict:
     n = len(times)
     groups = _sweep_groups(times, detectors, window)
+
+    # 每个候选事件占用的家族位（含同一家族两成员的内部冲突）
+    hit_fmask = [0] * n
+    if families:
+        for f, members in enumerate(families):
+            for j in members:
+                hit_fmask[j] |= 1 << f
+
+    event_options: List[List[Tuple[int, int, int, Tuple[int, ...]]]] = []
+    for i in range(n):
+        opts = []
+        for g in groups[i]:
+            gm, gain, gf = 0, 0, 0
+            bad = False
+            for j in g:
+                if gf & hit_fmask[j]:
+                    bad = True
+                    break
+                gm |= 1 << j
+                gain += weights[j]
+                gf |= hit_fmask[j]
+            if not bad:
+                opts.append((gm, gain, gf, g))
+        event_options.append(opts)
 
     best_score = 0
     best_events = 0
     packings: List[Tuple[Tuple[int, ...], ...]] = []
 
-    def rec(i: int, used_mask: int, chosen: List[Tuple[int, ...]], score: int) -> None:
+    def rec(i: int, used_mask: int, used_fam: int,
+            chosen: List[Tuple[int, ...]], score: int) -> None:
         nonlocal best_score, best_events, packings
         while i < n and (used_mask & (1 << i)):
             i += 1
@@ -36,22 +62,17 @@ def brute_solve(
                 elif events == best_events:
                     packings.append(tuple(chosen))
             return
-        # i 作为噪声
-        rec(i + 1, used_mask, chosen, score)
+        # i 作为噪声（噪声不占用家族）
+        rec(i + 1, used_mask, used_fam, chosen, score)
         # 以 i 为锚点建事件
-        for g in groups[i]:
-            gm = 0
-            gain = 0
-            for j in g:
-                gm |= 1 << j
-                gain += weights[j]
-            if used_mask & gm:
+        for gm, gain, gf, g in event_options[i]:
+            if used_mask & gm or used_fam & gf:
                 continue
             chosen.append(g)
-            rec(i + 1, used_mask | gm, chosen, score + gain)
+            rec(i + 1, used_mask | gm, used_fam | gf, chosen, score + gain)
             chosen.pop()
 
-    rec(0, 0, [], 0)
+    rec(0, 0, 0, [], 0)
 
     count = len(packings)
     pair_count: Dict[Tuple[int, int], int] = {}
