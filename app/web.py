@@ -65,6 +65,7 @@ def _validate(payload: Any) -> Tuple[List[Dict[str, str]], Dict[str, Any] | None
 
     hits = payload.get("hits")
     clean_hits: List[Dict[str, Any]] = []
+    seen_ids = set()
     if "hits" not in payload:
         errors.append({"path": "hits", "message": "hits is required"})
     elif not isinstance(hits, list):
@@ -74,7 +75,6 @@ def _validate(payload: Any) -> Tuple[List[Dict[str, str]], Dict[str, Any] | None
             errors.append(
                 {"path": "hits", "message": "hits must contain 4 to 80 items"}
             )
-        seen_ids = set()
         for k, hit in enumerate(hits):
             if not isinstance(hit, dict):
                 errors.append({
@@ -137,10 +137,90 @@ def _validate(payload: Any) -> Tuple[List[Dict[str, str]], Dict[str, Any] | None
 
             clean_hits.append(hit)
 
+    alternatives = payload.get("alternatives")
+    clean_alts: List[Dict[str, Any]] = []
+    if "alternatives" in payload:
+        if not isinstance(alternatives, list):
+            errors.append({
+                "path": "alternatives",
+                "message": "alternatives must be an array",
+            })
+        else:
+            seen_families = set()
+            for k, alt in enumerate(alternatives):
+                if not isinstance(alt, dict):
+                    errors.append({
+                        "path": f"alternatives[{k}]",
+                        "message": "alternative must be an object",
+                    })
+                    continue
+                fam = alt.get("family")
+                if "family" not in alt:
+                    errors.append({
+                        "path": f"alternatives[{k}].family",
+                        "message": "family is required",
+                    })
+                elif not _is_ascii_str(fam):
+                    errors.append({
+                        "path": f"alternatives[{k}].family",
+                        "message": "family must be a non-empty ASCII string",
+                    })
+                elif fam in seen_families:
+                    errors.append({
+                        "path": f"alternatives[{k}].family",
+                        "message": "duplicate family",
+                    })
+                else:
+                    seen_families.add(fam)
+
+                members = alt.get("hits")
+                if "hits" not in alt:
+                    errors.append({
+                        "path": f"alternatives[{k}].hits",
+                        "message": "hits is required",
+                    })
+                elif not isinstance(members, list):
+                    errors.append({
+                        "path": f"alternatives[{k}].hits",
+                        "message": "hits must be an array",
+                    })
+                else:
+                    if not (2 <= len(members) <= 6):
+                        errors.append({
+                            "path": f"alternatives[{k}].hits",
+                            "message": "hits must contain 2 to 6 items",
+                        })
+                    seen_members = set()
+                    for j, ref in enumerate(members):
+                        if not isinstance(ref, str):
+                            errors.append({
+                                "path": f"alternatives[{k}].hits[{j}]",
+                                "message": "hit reference must be a string",
+                            })
+                            continue
+                        if ref in seen_members:
+                            errors.append({
+                                "path": f"alternatives[{k}].hits[{j}]",
+                                "message": "duplicate hit in family",
+                            })
+                            continue
+                        seen_members.add(ref)
+                        if ref not in seen_ids:
+                            errors.append({
+                                "path": f"alternatives[{k}].hits[{j}]",
+                                "message": "dangling hit reference",
+                            })
+                clean_alts.append(alt)
+
     if errors:
         return errors, None
 
-    clean = {"window": window, "detectors": det_values, "hits": clean_hits}
+    clean = {
+        "window": window,
+        "detectors": det_values,
+        "hits": clean_hits,
+        "alternatives": clean_alts,
+    }
     return [], clean
 
 
@@ -157,7 +237,18 @@ def _run(clean: Dict[str, Any]) -> Dict[str, Any]:
     weights = [h["confidence"] for h in sorted_hits]
     ids = [h["id"] for h in sorted_hits]
 
-    result = solve(times, detectors, weights, window, id_order=ids)
+    # 互斥候选家族：命中标识引用 -> 排序后下标
+    families = None
+    if clean["alternatives"]:
+        id_to_pos = {hid: pos for pos, hid in enumerate(ids)}
+        families = [
+            [id_to_pos[ref] for ref in alt["hits"]]
+            for alt in clean["alternatives"]
+        ]
+
+    result = solve(
+        times, detectors, weights, window, id_order=ids, families=families
+    )
 
     canonical_groups = [
         sorted(ids[j] for j in group) for group in result["canonical"]
@@ -209,5 +300,6 @@ def audit() -> Any:
         return jsonify(_run(clean))
     except SolveError as exc:
         return jsonify({
-            "errors": [{"path": "hits", "message": str(exc)}]
+            "errors": [{"path": getattr(exc, "path", "hits"),
+                        "message": str(exc)}]
         }), 400

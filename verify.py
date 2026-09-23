@@ -48,7 +48,7 @@ def build_check() -> None:
 
 # ---------------------------------------------------------------- 算法核对
 def algorithm_checks() -> None:
-    from app.solver import solve
+    from app.solver import SolveError, solve
 
     # 1) 窗口边界：闭区间，t 差恰好为 W 可同组
     r = solve([0, 5, 6], [0, 1, 1], [5, 7, 9], 5,
@@ -95,6 +95,35 @@ def algorithm_checks() -> None:
                id_order=["a", "b", "c"])
     check("attribution: always pair count equals total",
           r2["pair_count"].get((0, 1)) == r2["total_count"] == 1)
+
+    # 5) 互斥候选：远隔家族成员改变最优解释（不同时刻、跨切分处）
+    r = solve([0, 1, 50, 51], [0, 1, 0, 1], [5, 7, 9, 4], 2,
+              id_order=["a", "b", "c", "d"], families=[[1, 2]])
+    check("alternatives: distant candidates reshape optimum",
+          r["best_score"] == 13 and r["best_events"] == 1
+          and r["total_count"] == 1 and r["canonical"] == [(2, 3)])
+
+    # 6) 多家族交叠的同优裁决：F={0,2}、G={1,3}，4 个同优解取最小序列
+    r = solve([0, 0, 0, 0], [0, 1, 2, 3], [1, 1, 1, 1], 0,
+              id_order=["a", "b", "c", "d"], families=[[0, 2], [1, 3]])
+    check("alternatives: overlapping families tie adjudication",
+          r["best_score"] == 2 and r["best_events"] == 1
+          and r["total_count"] == 4 and r["canonical"] == [(0, 1)])
+
+    # 7) 家族前沿边界：6 个活跃家族可解，7 个按 alternatives 拒绝
+    ft = list(range(14))
+    fids = [f"h{x:02d}" for x in range(14)]
+    r = solve(ft, [0] * 14, [1] * 14, 0, id_order=fids,
+              families=[[k, k + 7] for k in range(6)])
+    check("alternatives: frontier of 6 families accepted",
+          r["best_score"] == 0)
+    try:
+        solve(ft, [0] * 14, [1] * 14, 0, id_order=fids,
+              families=[[k, k + 7] for k in range(7)])
+        check("alternatives: frontier of 7 families rejected", False)
+    except SolveError as exc:
+        check("alternatives: frontier of 7 families rejected",
+              getattr(exc, "path", None) == "alternatives")
 
 
 # ---------------------------------------------------------------- 测试套件
@@ -177,6 +206,70 @@ def http_smoke() -> None:
         check("http: field errors by path without results",
               exc.code == 400
               and {"window", "detectors", "hits"} <= paths
+              and "optimal_confidence" not in body)
+
+    # 互斥候选：远隔家族改变最优解
+    alt = {
+        "window": 2,
+        "detectors": ["A", "B"],
+        "hits": [
+            {"id": "h1", "detector": "A", "time": 0, "confidence": 5},
+            {"id": "h2", "detector": "B", "time": 1, "confidence": 7},
+            {"id": "h3", "detector": "A", "time": 50, "confidence": 9},
+            {"id": "h4", "detector": "B", "time": 51, "confidence": 4},
+        ],
+    }
+    status, body = _request("POST", "/audit", alt)
+    base_conf = body["optimal_confidence"]
+    alt2 = dict(alt, alternatives=[{"family": "seg1", "hits": ["h2", "h3"]}])
+    status, body = _request("POST", "/audit", alt2)
+    check("http: alternatives reshape optimum",
+          base_conf == 25 and status == 200
+          and body["optimal_confidence"] == 13
+          and body["event_count"] == 1
+          and body["canonical_groups"] == [["h3", "h4"]]
+          and body["solution_count"] == "1")
+
+    # 悬空引用 / 重复家族：按具体路径拒绝且不夹带结果
+    bad_alt = dict(alt, alternatives=[
+        {"family": "s1", "hits": ["h1", "ghost"]},
+        {"family": "s1", "hits": ["h1", "h2"]},
+    ])
+    try:
+        _request("POST", "/audit", bad_alt)
+        check("http: invalid alternatives rejected by path", False)
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read().decode())
+        paths = {e["path"] for e in body.get("errors", [])}
+        check("http: invalid alternatives rejected by path",
+              exc.code == 400
+              and "alternatives[0].hits[1]" in paths
+              and "alternatives[1].family" in paths
+              and "optimal_confidence" not in body)
+
+    # 家族前沿超限：按 alternatives 路径拒绝
+    dense = {
+        "window": 0,
+        "detectors": ["A", "B"],
+        "hits": [
+            {"id": f"h{k:02d}", "detector": "AB"[k % 2], "time": k,
+             "confidence": 1}
+            for k in range(16)
+        ],
+        "alternatives": [
+            {"family": f"f{k}", "hits": [f"h{k:02d}", f"h{k + 8:02d}"]}
+            for k in range(7)
+        ],
+    }
+    try:
+        _request("POST", "/audit", dense)
+        check("http: family frontier overflow rejected", False)
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read().decode())
+        check("http: family frontier overflow rejected",
+              exc.code == 400
+              and any(e["path"] == "alternatives"
+                      for e in body.get("errors", []))
               and "optimal_confidence" not in body)
 
 

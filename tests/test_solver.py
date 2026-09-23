@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 import time
 
+import pytest
+
 from app.solver import SolveError, solve
 
 
@@ -156,3 +158,130 @@ def test_dense_window_rejected_via_solver():
     except SolveError:
         return
     raise AssertionError("expected SolveError")
+
+
+def test_alternatives_distant_candidates_change_optimum():
+    # 两段远隔波形各自成事件；同一家族强制二选一
+    times = [0, 1, 50, 51]
+    detectors = [0, 1, 0, 1]
+    weights = [5, 7, 9, 4]
+    base = solve(times, detectors, weights, 2, id_order=_ids(4))
+    assert base["best_score"] == 25  # (0,1) + (2,3) 两事件
+    got = solve(times, detectors, weights, 2, id_order=_ids(4),
+                families=[[1, 2]])  # h01 与 h02 互斥
+    # 只能保留一段：选可信度更高的 (2,3)=13 而非 (0,1)=12
+    assert got["best_score"] == 13
+    assert got["best_events"] == 1
+    assert got["total_count"] == 1
+    assert got["canonical"] == [(2, 3)]
+    # 归属基于受限后的全部最优解
+    assert got["pair_count"][(2, 3)] == 1      # 必然
+    assert (0, 1) not in got["pair_count"]     # 受限后从不
+    assert got["member_count"].get(0, 0) == 0
+
+
+def test_alternatives_event_with_two_members_same_family_illegal():
+    # 三个命中两两兼容；家族 {0,2} 使三元事件与 (0,2) 均非法
+    times = [0, 1, 2]
+    detectors = [0, 1, 2]
+    weights = [5, 5, 5]
+    base = solve(times, detectors, weights, 2, id_order=_ids(3))
+    assert base["best_score"] == 15  # 无约束时三元事件
+    got = solve(times, detectors, weights, 2, id_order=_ids(3),
+                families=[[0, 2]])
+    # 受限后最优为二元事件 (0,1) 或 (1,2)
+    assert got["best_score"] == 10
+    assert got["best_events"] == 1
+    assert got["total_count"] == 2
+    assert got["canonical"] == [(0, 1)]
+    assert got["pair_count"][(0, 1)] == 1   # 可选
+    assert got["pair_count"][(1, 2)] == 1   # 可选
+    assert (0, 2) not in got["pair_count"]
+    assert got["member_count"][1] == 2      # 中间命中必然被分组
+
+
+def test_alternatives_noise_member_does_not_consume_family():
+    # 家族 {0,3}：最优解中 0 为噪声、3 被分组 —— 噪声不占用家族
+    times = [0, 1, 2, 3]
+    detectors = [0, 1, 1, 0]
+    weights = [7, 1, 9, 8]
+    # (0,1)+(2,3)=25 因家族冲突非法；(2,3)=17 合法且 0 为噪声
+    got = solve(times, detectors, weights, 2, id_order=_ids(4),
+                families=[[0, 3]])
+    assert got["best_score"] == 17
+    assert got["best_events"] == 1
+    assert got["total_count"] == 1
+    assert got["canonical"] == [(2, 3)]
+
+
+def test_alternatives_overlapping_families_tie():
+    # 家族 F={0,2} 与 G={1,3} 交叠；等权同刻，多个同优解释
+    times = [0, 0, 0, 0]
+    detectors = [0, 1, 2, 3]
+    weights = [1, 1, 1, 1]
+    got = solve(times, detectors, weights, 0, id_order=_ids(4),
+                families=[[0, 2], [1, 3]])
+    # 每个家族至多一员被分组 -> 至多一个二元事件；共 4 个同优解
+    assert got["best_score"] == 2
+    assert got["best_events"] == 1
+    assert got["total_count"] == 4
+    # 规范裁决取成员标识序列最小者
+    assert got["canonical"] == [(0, 1)]
+    # 每对都在恰好一个最优解中 -> 可选
+    for pair in [(0, 1), (0, 3), (1, 2), (2, 3)]:
+        assert got["pair_count"][pair] == 1
+
+
+def test_alternatives_hit_in_two_families():
+    # 命中 1 同时属于两个家族：分组 1 会同时占用两者
+    times = [0, 1, 2, 3]
+    detectors = [0, 1, 0, 1]
+    weights = [5, 6, 7, 8]
+    got = solve(times, detectors, weights, 3, id_order=_ids(4),
+                families=[[0, 1], [1, 2]])
+    # (0,1)、(1,2) 均因同族冲突非法；最优为 (2,3)=15
+    assert got["best_score"] == 15
+    assert got["canonical"] == [(2, 3)]
+
+
+def test_alternatives_frontier_boundary():
+    # 切分处 7 同时有 6 个活跃家族 -> 允许；7 个 -> 拒绝
+    times = list(range(14))
+    detectors = [0] * 14
+    weights = [1] * 14
+    ids = _ids(14)
+    fam6 = [[k, k + 7] for k in range(6)]
+    got = solve(times, detectors, weights, 0, id_order=ids, families=fam6)
+    assert got["best_score"] == 0
+    fam7 = [[k, k + 7] for k in range(7)]
+    with pytest.raises(SolveError) as excinfo:
+        solve(times, detectors, weights, 0, id_order=ids, families=fam7)
+    assert excinfo.value.path == "alternatives"
+
+
+def test_alternatives_empty_list_matches_unconstrained():
+    times = [0, 1, 2, 3]
+    detectors = [0, 1, 0, 1]
+    weights = [3, 5, 7, 2]
+    base = solve(times, detectors, weights, 2, id_order=_ids(4))
+    got = solve(times, detectors, weights, 2, id_order=_ids(4), families=[])
+    assert got["best_score"] == base["best_score"]
+    assert got["best_events"] == base["best_events"]
+    assert got["total_count"] == base["total_count"]
+    assert got["canonical"] == base["canonical"]
+    assert got["pair_count"] == base["pair_count"]
+
+
+def test_alternatives_future_member_visible_via_window_mask():
+    # 家族 {k, j}（位置 1 与 3）：锚点 a 的事件分组了 j；处理 k 时
+    # j 尚未被处理、但其占用位仍在 k 的闭窗内可见，k 必须视为家族已用。
+    # 否则非法组合 (a,j)+(k,m)=40 会被错误接受。
+    times = [0, 3, 3, 5]
+    detectors = [0, 0, 1, 1]
+    weights = [10, 10, 10, 10]
+    got = solve(times, detectors, weights, 5, id_order=["a", "k", "m", "j"],
+                families=[[1, 3]])
+    assert got["best_score"] == 20
+    assert got["best_events"] == 1
+    assert got["total_count"] == 3
+    assert got["canonical"] == [(0, 3)]

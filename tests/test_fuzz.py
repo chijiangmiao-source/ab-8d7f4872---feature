@@ -46,6 +46,43 @@ def test_matches_brute(seed):
     assert got["member_count"] == expected["member_count"]
 
 
+@pytest.mark.parametrize("seed", range(120))
+def test_matches_brute_with_families(seed):
+    rng = random.Random(50_000 + seed)
+    n = rng.randint(4, 12)
+    ndet = rng.randint(2, min(5, n))
+    window = rng.randint(0, 6)
+
+    times = sorted(rng.randint(0, 12) for _ in range(n))
+    for _ in range(100):
+        if all(
+            sum(1 for t2 in times if t1 <= t2 <= t1 + window) <= 10
+            for t1 in times
+        ):
+            break
+        times = sorted(rng.randint(0, 12) for _ in range(n))
+    detectors = [rng.randrange(ndet) for _ in range(n)]
+    weights = [rng.randint(1, 8) for _ in range(n)]
+
+    # 随机互斥家族（允许命中同时属于多个家族；至多 3 个家族，
+    # 前沿必然不超过 6）
+    families = []
+    for _ in range(rng.randint(1, 3)):
+        size = rng.randint(2, min(6, n))
+        families.append(sorted(rng.sample(range(n), size)))
+
+    expected = brute_solve(times, detectors, weights, window,
+                           families=families)
+    got = solve(times, detectors, weights, window, families=families)
+
+    assert got["best_score"] == expected["best_score"]
+    assert got["best_events"] == expected["best_events"]
+    assert got["total_count"] == expected["total_count"]
+    assert _normalize(got["canonical"]) == _normalize(expected["canonical"])
+    assert got["pair_count"] == expected["pair_count"]
+    assert got["member_count"] == expected["member_count"]
+
+
 def test_sorted_ids_break_ties_by_time_then_id():
     # 同一时刻多命中时按标识排序，规范事件内成员标识升序
     raw = [
